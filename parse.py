@@ -1,82 +1,167 @@
 import codecs
 import re
+import urlparse
 
 from lib.abstract import printable
 
 
 class Error(Exception): pass
 class ParseError(Error): pass
+class ConsumeError(ParseError): pass
 
 
-def iter_blocks(path):
-	"""The LiveHeader output file consists of blocks
-	of text separated by hyphen-only lines. Open the
-	file and iterate over the split blocks.
+def iter_lines_tagged(file, eol=r'(?:\r?\n|\n?\r)'):
+	"""Iterate over every line in the file. Return a
+	tuple (tag, text) where <tag> is "eop" if the line
+	marks an "end of part", "eob" if it marks an "end
+	of block", or "text" if it is a proper row of text.
+
+	A LiveHeader output file consists of "blocks"
+	of text separated by hyphen-only lines. Each block
+	consists of three "parts".
+
+	Each blocks is the log of a single request-response
+	interaction.
 	"""
 
-	## FIXME: This will overtax the CPU for large
-	## files without a hyphen-only line.
+	m = re.compile(
+		r'(?:'
+		r'(?P<eop>' + eol + r')|'
+		r'(?P<eob>-{5,})|'
+		r'(?P<text>.+?)'
+		r')'
+		r'(?:' + eol + r'|$)')
 
-	## TODO: Make a parser that works on a line-by-
-	## line basis.
+	for x in m.finditer(file.read()):
 
-	m = re.compile(r'(?s)(.+?)\r?\n---+')
-	with codecs.open(path, "rb", "utf8") as f:
-		for x in m.finditer(f.read()):
-			yield x.group(1)
+		if x.group("eop"):
+			yield "eop", None
+		elif x.group("eob"):
+			yield "eob", None
+		elif x.group("text"):
+			yield "text", x.group("text")
+
+
+def parse_key_value_pair(text, sep=r':'):
+	"""Split a (line of) text at the first
+	occurrence of <sep>.
+	"""
+	kv = re.split(sep, text, maxsplit=1)
+	if not len(kv) == 2: raise ParseError("parse_key_value_pair: text is not a key-value pair: |%s|" % text)
+	return kv[0].strip(), kv[1].strip()
 
 
 @printable
-class ParsedBlock(object):
-	"""Represents a text block (e.g. as returned by
-	iter_blocks()) parsed into its component parts.
+class Interaction(object):
+	"""Represents a single request-response interaction
+	i.e. a parsed "block" that had been read from a
+	LiveHeader output file.
 	"""
 
-	def __init__(self, text):
-		p1, p2, p3 = self.split_block_into_parts(text)
-		
-		self.url = p1
-		self.get, self.req = self.split_header_part(p2)
-		self.ret, self.res = self.split_header_part(p3)
+	def __init__(self):
+		self.url = "" ## The URL that was fetched.
+		self.get = "" ## The HTTP GET string.
+		self.ret = "" ## The HTTP response string.
+		self.req = {} ## The request headers.
+		self.res = {} ## The response headers.
 
-	@classmethod
-	def split_block_into_parts(cls, text):
-		"""Each block has three parts, separated by
-		a double CRLF: the URL that was fetched, the
-		request header, and the response header.
-		"""
-		parts = re.split(r'\r?\n\r?\n', text)
-		if not len(parts) == 3: raise ParseError(
-			"ParsedBlock: invalid block; expected exactly three compartments")
-		return parts
 
-	@classmethod
-	def split_header_part(cls, text):
-		"""Each of the two header parts will have
-		a non-header line of text prior to its header's
-		key-value fields. Return a 2-tuple: the first
-		element is the non-header line of text, the
-		second element a dictionary of the header fields.
-		"""
+class TaggedLineConsumer(object):
 
-		lines = re.split(r'\r?\n', text)
+	def __init__(self, cls):
+		self.cls = cls
+		self.reset()
 
-		if not lines: raise ParseError(
-			"ParsedBlock: invalid block part; has too few lines; need at least 1")
+	def reset(self):
+		self.it = self.cls()
+		self.method = self.consume_first
 
-		header = {}
+	def consume_first(self, *aa, **kk):
+		raise NotImplementedError
 
-		for line in lines[1:]:
+	def skip_until_next(self, *aa, **kk):
+		pass
 
-			kv = re.split(r' *: *', line, maxsplit=1)
-			if not len(kv) == 2: raise ParseError("ParsedBlock: invalid header field |%s|" % line)
+	def consume(self, *aa, **kk):
 
-			header[kv[0].strip()] = kv[1].strip()
+		try:
+			return self.method(*aa, **kk)
+		except ConsumeError as e:
+			self.method = self.skip_until_next
+			return e
 
-		return (lines[0], header)
+
+class InteractionTLC(TaggedLineConsumer):
+
+	def __init__(self):
+		TaggedLineConsumer.__init__(self, Interaction)
+
+	def consume_first(self, *aa, **kk):
+		return self.consume_url(*aa, **kk)
+
+	def skip_until_next(self, tag, text):
+		if tag == "eob":
+			self.method = self.consume_url
+
+	def consume_url(self, tag, text):
+		if tag != "text": raise ConsumeError("Interaction.scan: expected the interaction's URL line")
+		self.it.url = text
+		self.method = self.consume_eop
+
+	def consume_eop(self, tag, text):
+		if tag != "eop": raise ConsumeError("Interaction.scan: expected end of part")
+		self.method = self.consume_get
+
+	def consume_get(self, tag, text):
+		if tag != "text": raise ConsumeError("Interaction.scan: expected the interaction's GET line")
+		self.it.get = text
+		self.method = self.consume_kv_or_eop
+
+	def consume_kv_or_eop(self, tag, text):
+		if tag == "eop":
+			self.method = self.consume_ret
+		elif tag == "text":
+			try: k, v = parse_key_value_pair(text)
+			except ParseError:
+				self.data = urlparse.parse_qs(text)
+				self.method = self.consume_ret
+			else:
+				self.it.req[k] = v
+				# self.method = consume_kv_or_eop
+		else:
+			raise ConsumeError("Interaction.scan: expected request header field or end of part")
+			
+	def consume_ret(self, tag, text):
+		if tag != "text": raise ConsumeError("Interaction.scan: expected the interaction's RET line")
+		self.it.ret = text
+		self.method = self.consume_kv_or_eob
+
+	def consume_kv_or_eob(self, tag, text):
+		if tag == "eob":
+			it = self.it
+			self.it = Interaction()
+			self.method = self.consume_url
+			return it
+		elif tag == "text":
+			k, v = parse_key_value_pair(text)
+			self.it.res[k] = v
+			# self.method = consume_kv_or_eob
+		else:
+			raise ConsumeError("Interaction.scan: expected response header field or end of block")
 
 
 if "__main__" == __name__:
-	for n, b in enumerate(iter_blocks("samples/1")):
-		print ParsedBlock(b)
-		break
+	path = "samples/1"
+	count = 0
+	with codecs.open(path, "rb", "utf8") as file:
+		tlc = InteractionTLC()
+		for tl in iter_lines_tagged(file):
+			obj = tlc.consume(*tl)
+			if isinstance(obj, Error):
+				print obj
+				print "-" * 78
+			elif obj:
+				count += 1
+				# print obj
+				# print "-" * 78
+	print count, "interactions found"
